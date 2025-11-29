@@ -18,7 +18,7 @@ SCRIPT_DIR="$(dirname "$TRUST_SCRIPT_PATH")"
 SETUP_MARKER_FILE="/var/lib/frpulse/.setup_complete" # Changed TrustTunnel to FRPulse
 
 # --- Script Version ---
-SCRIPT_VERSION="1.5.0" # Define the script version - UPDATED TO 1.5.0
+SCRIPT_VERSION="1.6.0" # Define the script version - UPDATED TO 1.6.0
 
 # --- Helper Functions ---
 
@@ -754,6 +754,21 @@ masquerade:
     fi
   fi
 
+  # Ignore Client Bandwidth Hint
+  local ignore_client_bandwidth_config=""
+  echo -e "👉 ${WHITE}Do you want to ignore client bandwidth hints? (Y/n, default: n)${RESET}"
+  echo -e "   ${YELLOW}Note: Useful to prevent clients from manipulating bandwidth limits.${RESET}"
+  read -p "" ignore_client_bandwidth_choice
+  ignore_client_bandwidth_choice=${ignore_client_bandwidth_choice:-n}
+
+  if [[ "$ignore_client_bandwidth_choice" =~ ^[Yy]$ ]]; then
+    ignore_client_bandwidth_config="ignoreClientBandwidth: true"
+    print_success "Server will ignore client bandwidth hints."
+  else
+    echo -e "${YELLOW}Server will respect client bandwidth hints.${RESET}"
+  fi
+  echo ""
+
   # Speedtest for server
   local speedtest_config=""
   echo -e "👉 ${WHITE}Do you want to enable Speedtest? (Y/n, default: n):${RESET} "
@@ -894,6 +909,7 @@ ${sni_guard_config} # Conditionally add sniGuard
 ${obfuscation_config} # Optional obfuscation
 ${masquerade_config} # Optional masquerade
 ${bandwidth_config} # Optional bandwidth limits
+${ignore_client_bandwidth_config} # Optional ignore client bandwidth
 ${speedtest_config} # Optional speedtest
 ${quic_config}
 EOF
