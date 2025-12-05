@@ -18,7 +18,7 @@ SCRIPT_DIR="$(dirname "$TRUST_SCRIPT_PATH")"
 SETUP_MARKER_FILE="/var/lib/frpulse/.setup_complete" # Changed TrustTunnel to FRPulse
 
 # --- Script Version ---
-SCRIPT_VERSION="1.3.0" # Define the script version - UPDATED TO 1.3.0
+SCRIPT_VERSION="1.8.0" # Define the script version - UPDATED TO 1.8.0
 
 # --- Helper Functions ---
 
@@ -523,6 +523,114 @@ install_hysteria_action() {
   read -p ""
 }
 
+# New function for Port Hopping Configuration
+configure_port_hopping_action() {
+  clear
+  echo ""
+  draw_line "$CYAN" "=" 40
+  echo -e "${CYAN}     🦘 Port Hopping Management${RESET}"
+  draw_line "$CYAN" "=" 40
+  echo ""
+
+  echo -e "  ${YELLOW}1)${RESET} ${GREEN}Enable Port Hopping${RESET}"
+  echo -e "  ${YELLOW}2)${RESET} ${RED}Disable Port Hopping${RESET}"
+  echo -e "  ${YELLOW}3)${RESET} ${WHITE}Back to previous menu${RESET}"
+  echo ""
+  read -p "👉 Your choice: " ph_choice
+  echo ""
+
+  if [[ "$ph_choice" == "3" ]]; then
+    return
+  fi
+
+  local action_flag="-A"
+  local action_verb="enabled"
+  if [[ "$ph_choice" == "2" ]]; then
+    action_flag="-D"
+    action_verb="disabled"
+  elif [[ "$ph_choice" != "1" ]]; then
+    print_error "Invalid choice."
+    echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+    read -p ""
+    return
+  fi
+
+  # Detect Interface
+  local interface=$(ip route | grep default | awk '{print $5}' | head -n1)
+  if [[ -z "$interface" ]]; then
+      interface="eth0" # Fallback
+  fi
+  
+  echo -e "${CYAN}Detected network interface: ${WHITE}$interface${RESET}"
+  echo -e "${YELLOW}If this is incorrect, please enter the correct interface name (or press Enter to use detected):${RESET}"
+  read -p "👉 " user_interface
+  if [[ -n "$user_interface" ]]; then
+      interface="$user_interface"
+  fi
+  echo ""
+
+  echo -e "${CYAN}Select IP Version:${RESET}"
+  echo -e "  ${YELLOW}1)${RESET} ${WHITE}IPv4${RESET}"
+  echo -e "  ${YELLOW}2)${RESET} ${WHITE}IPv6${RESET}"
+  echo -e "  ${YELLOW}3)${RESET} ${WHITE}IPv4 & IPv6${RESET}"
+  read -p "👉 Your choice (1-3): " ip_ver_choice
+  echo ""
+
+  local start_port
+  local end_port
+  while true; do
+      echo -e "👉 ${WHITE}Enter Start Port (e.g., 20000):${RESET} "
+      read -p "" start_port
+      if validate_port "$start_port"; then break; else print_error "Invalid port."; fi
+  done
+
+  while true; do
+      echo -e "👉 ${WHITE}Enter End Port (e.g., 50000):${RESET} "
+      read -p "" end_port
+      if validate_port "$end_port" && (( end_port >= start_port )); then break; else print_error "Invalid port or less than start port."; fi
+  done
+  echo ""
+
+  local target_port
+  while true; do
+      echo -e "👉 ${WHITE}Enter Target Hysteria Server Port (e.g., 443):${RESET} "
+      read -p "" target_port
+      if validate_port "$target_port"; then break; else print_error "Invalid port."; fi
+  done
+  echo ""
+
+  # Execute Commands
+  if [[ "$ip_ver_choice" == "1" || "$ip_ver_choice" == "3" ]]; then
+      echo -e "${CYAN}Applying IPv4 rules...${RESET}"
+      # iptables -t nat -A PREROUTING -i eth0 -p udp --dport 20000:50000 -j REDIRECT --to-ports 443
+      if sudo iptables -t nat "$action_flag" PREROUTING -i "$interface" -p udp --dport "${start_port}:${end_port}" -j REDIRECT --to-ports "$target_port" 2>/dev/null; then
+          print_success "IPv4 Port Hopping $action_verb."
+      else
+          print_error "Failed to apply IPv4 rule. (Maybe it doesn't exist or iptables is missing?)"
+      fi
+  fi
+
+  if [[ "$ip_ver_choice" == "2" || "$ip_ver_choice" == "3" ]]; then
+      echo -e "${CYAN}Applying IPv6 rules...${RESET}"
+      # ip6tables -t nat -A PREROUTING -i eth0 -p udp --dport 20000:50000 -j REDIRECT --to-ports 443
+      if sudo ip6tables -t nat "$action_flag" PREROUTING -i "$interface" -p udp --dport "${start_port}:${end_port}" -j REDIRECT --to-ports "$target_port" 2>/dev/null; then
+          print_success "IPv6 Port Hopping $action_verb."
+      else
+          print_error "Failed to apply IPv6 rule. (Check if ip6tables is enabled/supported)"
+      fi
+  fi
+
+  if [[ "$ph_choice" == "1" ]]; then
+      echo ""
+      echo -e "${YELLOW}⚠️  IMPORTANT: These rules are not persistent across reboots.${RESET}"
+      echo -e "${YELLOW}   Please install 'iptables-persistent' or use a startup script to save them.${RESET}"
+  fi
+
+  echo ""
+  echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+  read -p ""
+}
+
 # New function for adding a Hysteria server
 add_new_hysteria_server_action() {
   clear
@@ -586,18 +694,35 @@ add_new_hysteria_server_action() {
   echo ""
 
   local certs_dir="/etc/letsencrypt/live"
-  if [ ! -d "$certs_dir" ]; then
-    print_error "❌ No certificates directory found at $certs_dir."
-    print_error "   Please ensure Certbot is installed and certificates are obtained."
-    echo -e "${YELLOW}Press Enter to return to main menu...${RESET}"
-    read -p ""
-    return
+  local self_signed_dir="$(pwd)/hysteria/certs/selfsigned"
+  local available_certs=()
+  local cert_paths=()
+  local key_paths=()
+
+  # Check LetsEncrypt Certs
+  if [ -d "$certs_dir" ]; then
+    while IFS= read -r domain; do
+        if [[ -n "$domain" ]]; then
+            available_certs+=("$domain (LetsEncrypt)")
+            cert_paths+=("$certs_dir/$domain/fullchain.pem")
+            key_paths+=("$certs_dir/$domain/privkey.pem")
+        fi
+    done < <(sudo find "$certs_dir" -maxdepth 1 -mindepth 1 -type d ! -name "README" -exec basename {} \;)
   fi
 
-  mapfile -t cert_domains < <(sudo find "$certs_dir" -maxdepth 1 -mindepth 1 -type d ! -name "README" -exec basename {} \;)
+  # Check Self-Signed Certs
+  if [ -d "$self_signed_dir" ]; then
+    while IFS= read -r name; do
+        if [[ -n "$name" ]]; then
+            available_certs+=("$name (Self-Signed)")
+            cert_paths+=("$self_signed_dir/$name/fullchain.pem")
+            key_paths+=("$self_signed_dir/$name/privkey.pem")
+        fi
+    done < <(find "$self_signed_dir" -maxdepth 1 -mindepth 1 -type d -exec basename {} \;)
+  fi
 
-  if [ ${#cert_domains[@]} -eq 0 ]; then
-    print_error "❌ No SSL certificates found in $certs_dir."
+  if [ ${#available_certs[@]} -eq 0 ]; then
+    print_error "❌ No SSL certificates found (LetsEncrypt or Self-Signed)."
     print_error "   Please create one from the 'Certificate management' menu first."
     echo -e "${YELLOW}Press Enter to return to main menu...${RESET}"
     read -p ""
@@ -605,23 +730,25 @@ add_new_hysteria_server_action() {
   fi
 
   echo -e "${CYAN}Available SSL Certificates:${RESET}"
-  for i in "${!cert_domains[@]}"; do
-    echo -e "  ${YELLOW}$((i+1)))${RESET} ${WHITE}${cert_domains[$i]}${RESET}"
+  for i in "${!available_certs[@]}"; do
+    echo -e "  ${YELLOW}$((i+1)))${RESET} ${WHITE}${available_certs[$i]}${RESET}"
   done
 
   local cert_choice
   while true; do
     echo -e "👉 ${WHITE}Select a certificate by number to use for Hysteria server:${RESET} "
     read -p "" cert_choice
-    if [[ "$cert_choice" =~ ^[0-9]+$ ]] && [ "$cert_choice" -ge 1 ] && [ "$cert_choice" -le ${#cert_domains[@]} ]; then
+    if [[ "$cert_choice" =~ ^[0-9]+$ ]] && [ "$cert_choice" -ge 1 ] && [ "$cert_choice" -le ${#available_certs[@]} ]; then
       break
     else
       print_error "Invalid selection. Please enter a valid number."
     fi
   done
-  local selected_domain_name="${cert_domains[$((cert_choice-1))]}"
-  tls_cert_file="$certs_dir/$selected_domain_name/fullchain.pem"
-  tls_key_file="$certs_dir/$selected_domain_name/privkey.pem"
+  
+  local selected_index=$((cert_choice-1))
+  tls_cert_file="${cert_paths[$selected_index]}"
+  tls_key_file="${key_paths[$selected_index]}"
+  local selected_cert_name="${available_certs[$selected_index]}"
 
   if [ ! -f "$tls_cert_file" ] || [ ! -f "$tls_key_file" ]; then
     print_error "❌ Selected SSL certificate files not found: $tls_cert_file or $tls_key_file."
@@ -631,7 +758,7 @@ add_new_hysteria_server_action() {
     read -p ""
     return
   fi
-  print_success "Selected certificate for TLS: $selected_domain_name"
+  print_success "Selected certificate: $selected_cert_name"
 
   case "$server_mode_choice" in
     1) # Strict Mode
@@ -753,6 +880,21 @@ masquerade:
   down: \"${download_bandwidth}Mbps\"" # Hysteria expects Mbps
     fi
   fi
+
+  # Ignore Client Bandwidth Hint
+  local ignore_client_bandwidth_config=""
+  echo -e "👉 ${WHITE}Do you want to ignore client bandwidth hints? (Y/n, default: n)${RESET}"
+  echo -e "   ${YELLOW}Note: Useful to prevent clients from manipulating bandwidth limits.${RESET}"
+  read -p "" ignore_client_bandwidth_choice
+  ignore_client_bandwidth_choice=${ignore_client_bandwidth_choice:-n}
+
+  if [[ "$ignore_client_bandwidth_choice" =~ ^[Yy]$ ]]; then
+    ignore_client_bandwidth_config="ignoreClientBandwidth: true"
+    print_success "Server will ignore client bandwidth hints."
+  else
+    echo -e "${YELLOW}Server will respect client bandwidth hints.${RESET}"
+  fi
+  echo ""
 
   # Speedtest for server
   local speedtest_config=""
@@ -894,6 +1036,7 @@ ${sni_guard_config} # Conditionally add sniGuard
 ${obfuscation_config} # Optional obfuscation
 ${masquerade_config} # Optional masquerade
 ${bandwidth_config} # Optional bandwidth limits
+${ignore_client_bandwidth_config} # Optional ignore client bandwidth
 ${speedtest_config} # Optional speedtest
 ${quic_config}
 EOF
@@ -990,29 +1133,100 @@ add_new_hysteria_client_action() {
   echo -e "${CYAN}⚙️ Client Configuration:${RESET}"
 
   local server_address
+  local server_port_string=""
+  local is_port_hopping=false
+  
   while true; do
-    echo -e "👉 ${WHITE}Enter server address (IPv4/IPv6 or domain, e.g., example.com, 192.168.1.1, 2a05:fc1:40:a1::2):${RESET} "
-    read -p "" server_address
-    if validate_host "$server_address"; then
-      break
+    echo -e "👉 ${WHITE}Enter server address (IPv4/IPv6 or domain).${RESET}"
+    echo -e "   ${YELLOW}For Single Port: Just enter the domain/IP (e.g., example.com)${RESET}"
+    echo -e "   ${YELLOW}For Port Hopping: Enter domain:port-range (e.g., example.com:20000-50000)${RESET}"
+    read -p "👉 " input_address
+    
+    # Check if input has port/range
+    # Regex to capture host and port. 
+    # Case 1: [IPv6]:port
+    if [[ "$input_address" =~ ^\[(.*)\]:([0-9,-]+)$ ]]; then
+        host_part="${BASH_REMATCH[1]}"
+        port_part="${BASH_REMATCH[2]}"
+        if validate_host "$host_part"; then
+             server_address="[$host_part]" # Keep brackets for config
+             server_port_string="$port_part"
+             if [[ "$server_port_string" =~ [,-] ]]; then is_port_hopping=true; fi
+             break
+        else
+             print_error "Invalid host part: $host_part"
+        fi
+    # Case 2: host:port (IPv4 or Domain)
+    elif [[ "$input_address" =~ ^([^:]+):([0-9,-]+)$ ]]; then
+        host_part="${BASH_REMATCH[1]}"
+        port_part="${BASH_REMATCH[2]}"
+        if validate_host "$host_part"; then
+             server_address="$host_part"
+             server_port_string="$port_part"
+             if [[ "$server_port_string" =~ [,-] ]]; then is_port_hopping=true; fi
+             break
+        else
+             print_error "Invalid host part: $host_part"
+        fi
+    # Case 3: Just host (IPv4, IPv6, Domain)
+    elif validate_host "$input_address"; then
+        if [[ "$input_address" =~ : ]]; then
+            server_address="[$input_address]" # Add brackets for IPv6
+        else
+            server_address="$input_address"
+        fi
+        break
     else
-      print_error "Invalid server address format. Please try again."
+        print_error "Invalid address format."
     fi
   done
   echo ""
 
-  local server_port
-  while true; do
-    echo -e "👉 ${WHITE}Enter server port (1-65535, e.g., 443, 8443):${RESET} "
-    read -p "" server_port_input
-    server_port=${server_port_input:-443}
-    if validate_port "$server_port"; then
-      break
-    else
-      print_error "Invalid port number. Please enter a number between 1 and 65535."
-    fi
-  done
+  # If port was not provided in address, ask for it
+  if [[ -z "$server_port_string" ]]; then
+      while true; do
+        echo -e "👉 ${WHITE}Enter server port(s).${RESET}"
+        echo -e "   ${YELLOW}Single port (443), list (443,8443), or range (20000-50000):${RESET}"
+        read -p "👉 " server_port_input
+        if [[ "$server_port_input" =~ ^[0-9,-]+$ ]]; then
+             server_port_string="$server_port_input"
+             if [[ "$server_port_string" =~ [,-] ]]; then
+                is_port_hopping=true
+             fi
+             break
+        else
+             print_error "Invalid port format."
+        fi
+      done
+  fi
   echo ""
+
+  local hop_interval_config=""
+  if [[ "$is_port_hopping" == "true" ]]; then
+      echo -e "${CYAN}Port Hopping detected!${RESET}"
+      echo -e "👉 ${WHITE}Set Hop Interval in seconds (Default: 30).${RESET}"
+      echo -e "   ${YELLOW}Enter 0 to disable hopping explicitly, or just press Enter for default (30s).${RESET}"
+      read -p "👉 Enter interval (e.g., 30): " hop_interval_input
+      
+      # Set default to 30 if empty
+      if [[ -z "$hop_interval_input" ]]; then
+          hop_interval_input="30"
+      fi
+
+      if [[ "$hop_interval_input" =~ ^[0-9]+$ ]]; then
+          hop_interval_config="transport:
+  type: udp
+  udp:
+    hopInterval: ${hop_interval_input}s"
+          print_success "Hop Interval set to ${hop_interval_input}s"
+      else
+          print_error "Invalid input. Defaulting to 30s."
+          hop_interval_config="transport:
+  type: udp
+  udp:
+    hopInterval: 30s"
+      fi
+  fi
 
   local password
   while true; do
@@ -1124,8 +1338,8 @@ tls:
   network_protocol_choice=${network_protocol_choice:-3}
 
   local forward_ports_input
-  local udp_forwarding_config=""
-  local tcp_forwarding_config=""
+  local udp_forwarding_content="" # Changed to hold only entries
+  local tcp_forwarding_content="" # Changed to hold only entries
 
   while true; do
     echo -e "👉 ${WHITE}Enter forwarding ports separated by commas (e.g., 43070,53875):${RESET} "
@@ -1150,24 +1364,22 @@ tls:
   done
   echo ""
 
-  # Generate UDP forwarding config
+  # Generate UDP forwarding content (entries only)
   if [[ "$network_protocol_choice" == "1" || "$network_protocol_choice" == "3" ]]; then
-    udp_forwarding_config="udpForwarding:"
     IFS=',' read -ra ADDR <<< "$forward_ports_input"
     for p in "${ADDR[@]}"; do
-      udp_forwarding_config+="
+      udp_forwarding_content+="
   - listen: 0.0.0.0:$p
     remote: '[::]:$p'
     timeout: 20s"
     done
   fi
 
-  # Generate TCP forwarding config
+  # Generate TCP forwarding content (entries only)
   if [[ "$network_protocol_choice" == "2" || "$network_protocol_choice" == "3" ]]; then
-    tcp_forwarding_config="tcpForwarding:"
     IFS=',' read -ra ADDR <<< "$forward_ports_input"
     for p in "${ADDR[@]}"; do
-      tcp_forwarding_config+="
+      tcp_forwarding_content+="
   - listen: 0.0.0.0:$p
     remote: '[::]:$p'
     timeout: 20s"
@@ -1289,13 +1501,16 @@ quic:
   # Create the Hysteria client config file (YAML)
   echo -e "${CYAN}📝 Creating hysteria-client-${client_name}.yaml configuration file...${RESET}"
   cat <<EOF > "$config_file_path"
-server: "[$server_address]:$server_port" # Updated to include brackets around server address
+server: "$server_address:$server_port_string" # Updated for Port Hopping support
 auth: "$password" # Updated password format
 $tls_config
 $obfs_config
 ${masquerade_config} # Optional masquerade
-${udp_forwarding_config}
-${tcp_forwarding_config}
+${hop_interval_config} # Optional hopInterval for Port Hopping
+
+$(if [[ -n "$udp_forwarding_content" ]]; then echo "udpForwarding:"; echo -e "$udp_forwarding_content"; echo ""; fi) # Always include header, add extra newline
+$(if [[ -n "$tcp_forwarding_content" ]]; then echo "tcpForwarding:"; echo -e "$tcp_forwarding_content"; fi) # Always include header
+
 ${quic_config} # Added QUIC parameters to client config
 EOF
   print_success "hysteria-client-${client_name}.yaml created successfully at $config_file_path"
@@ -1395,54 +1610,304 @@ speedtest_from_server_action() {
   read -p ""
 }
 
-# New function for Hysteria ping test
-hysteria_ping_test_action() {
+# New helper function for appending to YAML blocks
+# This function is designed to append new entries to an existing YAML list block.
+# It uses awk to find the block and insert the new content with correct indentation.
+append_to_yaml_block() {
+  local config_file="$1"
+  local block_key="$2" # e.g., "udpForwarding" or "tcpForwarding"
+  local new_entry_content="$3" # The multi-line YAML entry to add (e.g., "  - listen:...\n    remote:...")
+
+  awk -v key="$block_key" -v entry="$new_entry_content" '
+    BEGIN { in_block = 0; inserted = 0 }
+    $0 ~ "^" key ":" { # Found the block header
+      print; # Print the header
+      in_block = 1;
+      next;
+    }
+    in_block && /^[[:space:]]{2}[^[:space:]]/ { # Found a line with less indentation (end of block, e.g., next top-level key)
+      if (!inserted) { # Only insert if not already inserted in this block
+        print entry;
+        inserted = 1;
+      }
+      print; # Print the current line (which is the start of the next block)
+      in_block = 0; # Exit the block
+      next;
+    }
+    {
+      print; # Print current line
+    }
+    END {
+      if (in_block && !inserted) { # If still in block at EOF and not inserted
+        print entry; # Insert at the very end of the file
+      }
+    }
+  ' "$config_file" > "${config_file}.tmp"
+  mv "${config_file}.tmp" "$config_file"
+}
+
+# New helper function to insert a YAML block (header + first entry) if it's missing
+# This function checks if a YAML block (e.g., 'udpForwarding:') exists.
+# If not, it inserts the block header and the first entry before a specified pattern (e.g., 'quic:').
+insert_yaml_block_if_missing() {
+  local config_file="$1"
+  local block_key="$2" # e.g., "udpForwarding"
+  local new_entry_content="$3" # The multi-line YAML entry to add (e.g., "  - listen:...\n    remote:...")
+  local insert_before_pattern="$4" # Regex pattern for key to insert before, e.g., "tcpForwarding|quic"
+
+  if ! grep -q "^${block_key}:" "$config_file"; then
+    local temp_file=$(mktemp)
+    # The new block includes the header and the first entry
+    local new_block_yaml="${block_key}:\n${new_entry_content}"
+    local inserted_into_temp=false
+
+    # Try to insert before insert_before_pattern
+    awk -v insert_pattern="$insert_before_pattern" -v new_block="$new_block_yaml" '
+      BEGIN { inserted = 0 }
+      $0 ~ insert_pattern && !inserted {
+        print new_block;
+        print ""; # Add a blank line for separation after the new block
+        inserted = 1;
+      }
+      { print }
+    ' "$config_file" > "$temp_file"
+
+    # If the block was not inserted (e.g., insert_before_pattern not found), append to end
+    if [ "$(grep -c "^${block_key}:" "$temp_file")" -eq 0 ]; then
+      echo -e "\n${new_block_yaml}" >> "$temp_file"
+    fi
+    mv "$temp_file" "$config_file"
+    return 0 # Block was inserted
+  fi
+  return 1 # Block already exists
+}
+
+
+# New function to manage client forwarding ports
+manage_client_ports_action() {
   clear
   echo ""
   draw_line "$CYAN" "=" 40
-  echo -e "${CYAN}     📡 Hysteria Ping Test (Iran Server)${RESET}" # Updated title to English
+  echo -e "${CYAN}     ⚙️ Manage Client Ports${RESET}"
   draw_line "$CYAN" "=" 40
   echo ""
 
-  # Check for hysteria executable
-  if ! command -v hysteria &> /dev/null; then
-    echo -e "${RED}❗ Hysteria executable (hysteria) not found.${RESET}"
-    echo -e "${YELLOW}Please run 'Install Hysteria' option from the main menu first.${RESET}"
+  local config_dir="$(pwd)/hysteria"
+  # Find all hysteria client config files
+  mapfile -t client_configs < <(find "$config_dir" -maxdepth 1 -type f -name "hysteria-client-*.yaml" -printf "%f\n" | sort)
+
+  if [ ${#client_configs[@]} -eq 0 ]; then
+    print_error "❌ No Hysteria client configuration files found in $config_dir."
     echo ""
-    echo -e "${YELLOW}Press Enter to return to main menu...${RESET}"
+    echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
     read -p ""
-    return
+    return 0
   fi
 
-  local target_ip_port
-  echo -e "${YELLOW}Note: The port refers to the tunnel port you intend to use.${RESET}" # Added note
-  while true; do
-    echo -e "👉 ${WHITE}Enter IP address or domain and port to ping (e.g., 1.1.1.1:443, example.com:8443, [2606:4700::1111]:443, or 'q' to quit):${RESET} " # Updated prompt
-    read -p "" target_ip_port
-
-    if [[ "$target_ip_port" =~ ^[Qq]$ ]]; then # Check for 'q' to quit
-      echo -e "${YELLOW}Returning to main menu...${RESET}"
+  echo -e "${CYAN}📋 Please select a client to manage its ports:${RESET}"
+  client_configs+=("Back to previous menu")
+  select selected_config_file in "${client_configs[@]}"; do
+    if [[ "$selected_config_file" == "Back to previous menu" ]]; then
+      echo -e "${YELLOW}Returning to previous menu...${RESET}"
       echo ""
       return 0
-    elif validate_ip_port "$target_ip_port"; then
+    elif [ -n "$selected_config_file" ]; then
       break
     else
-      print_error "Invalid IP:Port or domain:Port format. Please try again or enter 'q' to quit."
+      print_error "Invalid selection. Please enter a valid number."
     fi
   done
   echo ""
 
-  echo -e "${CYAN}🚀 Running Hysteria ping test to ${WHITE}$target_ip_port${RESET} ...${RESET}"
-  echo ""
-  # Execute hysteria ping with the provided IP:Port and check its exit status
-  if /usr/local/bin/hysteria ping "$target_ip_port"; then
-    print_success "Hysteria ping test completed successfully."
-  else
-    print_error "Hysteria ping test failed. Please check the target IP/domain and port, or your network connectivity."
-  fi
-  echo ""
-  echo -e "${YELLOW}Press Enter to return to main menu...${RESET}"
-  read -p ""
+  local client_name=$(echo "$selected_config_file" | sed 's/hysteria-client-//' | sed 's/.yaml//')
+  local config_file_path="$config_dir/$selected_config_file"
+  local service_name="hysteria-client-$client_name"
+
+  while true; do
+    clear
+    echo ""
+    draw_line "$CYAN" "=" 40
+    echo -e "${CYAN}     ⚙️ Manage Ports for '$client_name'${RESET}"
+    draw_line "$CYAN" "=" 40
+    echo ""
+
+    echo -e "${CYAN}Current Forwarding Ports:${RESET}"
+    local udp_ports_array=()
+    local tcp_ports_array=()
+
+    # Extract UDP ports using awk for more robust block parsing
+    mapfile -t udp_lines < <(awk '
+      /^udpForwarding:/ {in_block=1; next}
+      /^[^[:space:]]/ {in_block=0} # End of block if new top-level key
+      in_block && /listen:/ {
+        split($0, a, ":")
+        port_num = a[length(a)] # Get the last part after the last colon
+        sub(/^[[:space:]]+/, "", port_num) # Remove leading spaces
+        print port_num
+      }
+    ' "$config_file_path")
+    udp_ports_array=("${udp_lines[@]}")
+
+    echo -e "  ${WHITE}UDP Ports:${RESET}"
+    if [ ${#udp_ports_array[@]} -gt 0 ]; then
+      for port in "${udp_ports_array[@]}"; do
+        echo -e "    - ${YELLOW}$port${RESET}"
+      done
+    else
+      echo -e "    ${RED}(None configured)${RESET}"
+    fi
+
+    # Extract TCP ports using awk
+    mapfile -t tcp_lines < <(awk '
+      /^tcpForwarding:/ {in_block=1; next}
+      /^[^[:space:]]/ {in_block=0} # End of block if new top-level key
+      in_block && /listen:/ {
+        split($0, a, ":")
+        port_num = a[length(a)] # Get the last part after the last colon
+        sub(/^[[:space:]]+/, "", port_num) # Remove leading spaces
+        print port_num
+      }
+    ' "$config_file_path")
+    tcp_ports_array=("${tcp_lines[@]}")
+
+    echo -e "  ${WHITE}TCP Ports:${RESET}"
+    if [ ${#tcp_ports_array[@]} -gt 0 ]; then
+      for port in "${tcp_ports_array[@]}"; do
+        echo -e "    - ${YELLOW}$port${RESET}"
+      done
+    else
+      echo -e "    ${RED}(None configured)${RESET}"
+    fi
+    echo ""
+
+    echo "Select an action:"
+    echo -e "  ${YELLOW}1)${RESET} ${WHITE}Reset and add new ports${RESET}" # New option
+    echo -e "  ${YELLOW}2)${RESET} ${WHITE}Back to client management menu${RESET}" # Adjusted number
+    echo ""
+    read -p "👉 Your choice: " port_manage_choice
+    echo ""
+
+    case $port_manage_choice in
+      1) # Reset and add new ports
+        local new_ports_input
+        while true; do
+          echo -e "👉 ${WHITE}Enter new forwarding ports separated by commas (e.g., 43070,53875):${RESET} "
+          read -p "" new_ports_input
+          if [[ -n "$new_ports_input" ]]; then
+            local invalid_port_found=false
+            IFS=',' read -ra ADDR <<< "$new_ports_input"
+            for p in "${ADDR[@]}"; do
+              if ! validate_port "$p"; then
+                print_error "Invalid port found: $p. Please enter valid ports between 1 and 65535."
+                invalid_port_found=true
+                break
+              fi
+            done
+            if [ "$invalid_port_found" = false ]; then
+              break
+            fi
+          else
+            print_error "Forwarding ports cannot be empty!"
+          fi
+        done
+        echo ""
+
+        local new_protocol_choice
+        echo -e "${CYAN}Select protocol for new ports:${RESET}"
+        echo -e "  ${YELLOW}1)${RESET} ${WHITE}UDP${RESET}"
+        echo -e "  ${YELLOW}2)${RESET} ${WHITE}TCP${RESET}"
+        echo -e "  ${YELLOW}3)${RESET} ${WHITE}Both${RESET}"
+        read -p "👉 Your choice (1-3): " new_protocol_choice
+        echo ""
+
+        local temp_file=$(mktemp)
+        cp "$config_file_path" "$temp_file"
+
+        # Remove existing udpForwarding and tcpForwarding blocks
+        # This sed command deletes lines from 'udpForwarding:' until the next top-level key or end of file.
+        # It handles cases where the block might be at the end of the file.
+        sed -i '/^udpForwarding:/,/^[[:alnum:]]/ { /^udpForwarding:/! { /^[[:alnum:]]/!d; }; }' "$temp_file"
+        sed -i '/^tcpForwarding:/,/^[[:alnum:]]/ { /^tcpForwarding:/! { /^[[:alnum:]]/!d; }; }' "$temp_file"
+        # The above sed commands are a bit complex to handle the end of file case.
+        # A simpler approach for deletion might be:
+        # sed -i '/^udpForwarding:/,${/^[[:alnum:]]/!d}' "$temp_file" # Deletes from udpForwarding to EOF
+        # sed -i '/^tcpForwarding:/,${/^[[:alnum:]]/!d}' "$temp_file" # Deletes from tcpForwarding to EOF
+        # This is more aggressive and might delete other blocks if they are after.
+        # Let's use a safer approach to delete the block and its content.
+
+        # A more robust way to delete a YAML block:
+        # Use awk to print lines, skipping the target block.
+        awk -v block1="udpForwarding" -v block2="tcpForwarding" '
+          BEGIN { skip = 0 }
+          $0 ~ "^" block1 ":" { skip = 1; next }
+          $0 ~ "^" block2 ":" { skip = 1; next }
+          skip == 1 && /^[[:alnum:]]/ { skip = 0 } # Stop skipping if a new top-level key is found
+          skip == 0 { print }
+        ' "$temp_file" > "${temp_file}.cleaned"
+        mv "${temp_file}.cleaned" "$temp_file"
+
+        local udp_new_content=""
+        local tcp_new_content=""
+
+        # Generate new UDP forwarding content
+        if [[ "$new_protocol_choice" == "1" || "$new_protocol_choice" == "3" ]]; then
+          IFS=',' read -ra ADDR <<< "$new_ports_input"
+          for p in "${ADDR[@]}"; do
+            udp_new_content+="  - listen: 0.0.0.0:$p\n    remote: '[::]:$p'\n    timeout: 20s\n"
+          done
+          udp_new_content="udpForwarding:\n${udp_new_content}"
+        fi
+
+        # Generate new TCP forwarding content
+        if [[ "$new_protocol_choice" == "2" || "$new_protocol_choice" == "3" ]]; then
+          IFS=',' read -ra ADDR <<< "$new_ports_input"
+          for p in "${ADDR[@]}"; do
+            tcp_new_content+="  - listen: 0.0.0.0:$p\n    remote: '[::]:$p'\n    timeout: 20s\n"
+          done
+          tcp_new_content="tcpForwarding:\n${tcp_new_content}"
+        fi
+
+        local insert_point=$(grep -n "^quic:" "$temp_file" | head -n 1 | cut -d: -f1)
+        if [[ -z "$insert_point" ]]; then
+            # If 'quic:' block not found, append to the end
+            if [[ -n "$udp_new_content" ]]; then
+                echo -e "\n${udp_new_content}" >> "$temp_file"
+            fi
+            if [[ -n "$tcp_new_content" ]]; then
+                echo -e "\n${tcp_new_content}" >> "$temp_file"
+            fi
+        else
+            # Insert before 'quic:' block
+            local insert_line_num=$((insert_point - 1))
+            if [[ -n "$tcp_new_content" ]]; then
+                sed -i "${insert_line_num}i\\
+${tcp_new_content}" "$temp_file"
+                insert_line_num=$((insert_line_num)) # Adjust if UDP is also inserted
+            fi
+            if [[ -n "$udp_new_content" ]]; then
+                sed -i "${insert_line_num}i\\
+${udp_new_content}" "$temp_file"
+            fi
+        fi
+
+        mv "$temp_file" "$config_file_path"
+        print_success "Ports reset and added successfully."
+        echo -e "${CYAN}Restarting Hysteria client '$client_name' to apply changes...${RESET}"
+        sudo systemctl restart "$service_name" > /dev/null 2>&1
+        print_success "Client service restarted."
+        ;;
+      2) # Back to client management menu (adjusted number)
+        echo -e "${YELLOW}Returning to client management menu...${RESET}"
+        break
+        ;;
+      *)
+        echo -e "${RED}❌ Invalid option.${RESET}"
+        ;;
+    esac
+    echo ""
+    echo -e "${YELLOW}Press Enter to continue...${RESET}"
+    read -p ""
+  done
 }
 
 
@@ -1593,6 +2058,136 @@ delete_certificates_action() {
   read -p ""
 }
 
+# Function to generate a self-signed certificate
+generate_self_signed_cert_action() {
+  clear
+  echo ""
+  draw_line "$CYAN" "=" 40
+  echo -e "${CYAN}     📝 Generate Self-Signed Certificate${RESET}"
+  draw_line "$CYAN" "=" 40
+  echo ""
+  
+  echo -e "${YELLOW}⚠️  WARNING: Self-signed certificates only work with SNI Mode!${RESET}"
+  echo -e "${YELLOW}    Do not use this for Strict Mode.${RESET}"
+  echo ""
+
+  local cert_name
+  while true; do
+    echo -e "👉 ${WHITE}Enter a name for this certificate (e.g., my-self-signed):${RESET} "
+    read -p "" cert_name
+    # Sanitize input
+    cert_name=$(echo "$cert_name" | tr -cd '[:alnum:]_-')
+    if [[ -n "$cert_name" ]]; then
+      break
+    else
+      print_error "Certificate name cannot be empty."
+    fi
+  done
+  echo ""
+
+  local cert_dir="$(pwd)/hysteria/certs/selfsigned/$cert_name"
+  if [ -d "$cert_dir" ]; then
+    print_error "A certificate with this name already exists."
+    echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+    read -p ""
+    return
+  fi
+
+  mkdir -p "$cert_dir"
+
+  echo -e "${CYAN}Generating self-signed certificate...${RESET}"
+  
+  # Generate key and cert
+  # using the name as CN
+  if openssl req -x509 -newkey rsa:2048 -keyout "$cert_dir/privkey.pem" -out "$cert_dir/fullchain.pem" -sha256 -days 3650 -nodes -subj "/CN=$cert_name" 2>/dev/null; then
+    print_success "Self-signed certificate generated successfully."
+    echo -e "   Path: ${WHITE}$cert_dir${RESET}"
+  else
+    print_error "Failed to generate certificate. Please check if openssl is installed."
+    rm -rf "$cert_dir" # Cleanup
+  fi
+
+  echo ""
+  echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+  read -p ""
+}
+
+# Function to delete self-signed certificates
+delete_self_signed_cert_action() {
+  clear
+  echo ""
+  draw_line "$RED" "=" 40
+  echo -e "${RED}     🗑️ Delete Self-Signed Certificate${RESET}"
+  draw_line "$RED" "=" 40
+  echo ""
+
+  local cert_base_dir="$(pwd)/hysteria/certs/selfsigned"
+  
+  if [ ! -d "$cert_base_dir" ]; then
+     print_error "No self-signed certificates found."
+     echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+     read -p ""
+     return
+  fi
+
+  mapfile -t cert_names < <(find "$cert_base_dir" -maxdepth 1 -mindepth 1 -type d -exec basename {} \;)
+
+  if [ ${#cert_names[@]} -eq 0 ]; then
+    print_error "No self-signed certificates found."
+    echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+    read -p ""
+    return
+  fi
+
+  echo -e "${CYAN}📋 Please select a certificate to delete:${RESET}"
+  cert_names+=("Back to previous menu")
+  select selected_cert in "${cert_names[@]}"; do
+    if [[ "$selected_cert" == "Back to previous menu" ]]; then
+      return
+    elif [ -n "$selected_cert" ]; then
+      break
+    else
+      print_error "Invalid selection."
+    fi
+  done
+
+  echo -e "${RED}⚠️ Are you sure you want to delete '$selected_cert'? (y/N): ${RESET}"
+  read -p "" confirm
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      rm -rf "$cert_base_dir/$selected_cert"
+      print_success "Certificate deleted."
+  else
+      echo -e "${YELLOW}Cancelled.${RESET}"
+  fi
+  
+  echo ""
+  echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+  read -p ""
+}
+
+# Self-signed certificate menu
+self_signed_certificate_menu() {
+  while true; do
+    clear
+    echo ""
+    draw_line "$CYAN" "=" 40
+    echo -e "${CYAN}     📝 Self-Signed Certificates${RESET}"
+    draw_line "$CYAN" "=" 40
+    echo ""
+    echo -e "  ${YELLOW}1)${RESET} ${WHITE}Generate new certificate${RESET}"
+    echo -e "  ${YELLOW}2)${RESET} ${WHITE}Delete certificate${RESET}"
+    echo -e "  ${YELLOW}3)${RESET} ${WHITE}Back to previous menu${RESET}"
+    echo ""
+    read -p "👉 Your choice: " choice
+    case $choice in
+      1) generate_self_signed_cert_action ;;
+      2) delete_self_signed_cert_action ;;
+      3) break ;;
+      *) print_error "Invalid option." ;;
+    esac
+  done
+}
+
 # --- New: Certificate Management Menu Function ---
 certificate_management_menu() {
   while true; do
@@ -1604,7 +2199,8 @@ certificate_management_menu() {
     echo ""
     echo -e "  ${YELLOW}1)${RESET} ${WHITE}Get new certificate${RESET}"
     echo -e "  ${YELLOW}2)${RESET} ${WHITE}Delete certificates${RESET}"
-    echo -e "  ${YELLOW}3)${RESET} ${WHITE}Back to main menu${RESET}"
+    echo -e "  ${YELLOW}3)${RESET} ${WHITE}Self signed certificate${RESET}"
+    echo -e "  ${YELLOW}4)${RESET} ${WHITE}Back to main menu${RESET}"
     echo ""
     draw_line "$YELLOW" "-" 40
     echo -e "👉 ${CYAN}Your choice:${RESET} "
@@ -1619,6 +2215,9 @@ certificate_management_menu() {
         delete_certificates_action
         ;;
       3)
+        self_signed_certificate_menu
+        ;;
+      4)
         echo -e "${YELLOW}Returning to main menu...${RESET}"
         break # Break out of this while loop to return to main menu
         ;;
@@ -1682,10 +2281,9 @@ while true; do
   echo ""
   echo -e "${MAGENTA}1) Install Hysteria${RESET}"
   echo -e "${CYAN}2) Hysteria tunnel management${RESET}"
-  echo -e "${BLUE}3) Hysteria ping test (use on Iran server)${RESET}" # NEW OPTION IN MAIN MENU, text updated
-  echo -e "${YELLOW}4) Certificate management${RESET}" # Re-numbered
-  echo -e "${RED}5) Uninstall Hysteria and cleanup${RESET}" # Re-numbered
-  echo -e "${WHITE}6) Exit${RESET}" # Re-numbered
+  echo -e "${YELLOW}3) Certificate management${RESET}" # Re-numbered from 4 to 3
+  echo -e "${RED}4) Uninstall Hysteria and cleanup${RESET}" # Re-numbered from 5 to 4
+  echo -e "${WHITE}5) Exit${RESET}" # Re-numbered from 6 to 5
   echo ""
   read -p "👉 Your choice: " choice
 
@@ -1724,7 +2322,8 @@ while true; do
               echo -e "  ${YELLOW}3)${RESET} ${WHITE}Delete a Hysteria server${RESET}"
               echo -e "  ${YELLOW}4)${RESET} ${MAGENTA}Schedule Hysteria server restart${RESET}"
               echo -e "  ${YELLOW}5)${RESET} ${RED}Delete scheduled restart${RESET}"
-              echo -e "  ${YELLOW}6)${RESET} ${WHITE}Back to previous menu${RESET}"
+              echo -e "  ${YELLOW}6)${RESET} ${GREEN}Port Hopping Management${RESET}"
+              echo -e "  ${YELLOW}7)${RESET} ${WHITE}Back to previous menu${RESET}"
               echo ""
               draw_line "$CYAN" "-" 40
               echo -e "👉 ${CYAN}Your choice:${RESET} "
@@ -1739,7 +2338,7 @@ while true; do
                   clear
                   echo ""
                   draw_line "$CYAN" "=" 40
-                  echo -e "${CYAN}     � Hysteria Server Logs${RESET}"
+                  echo -e "${CYAN}     📊 Hysteria Server Logs${RESET}"
                   draw_line "$CYAN" "=" 40
                   echo ""
                   echo -e "${CYAN}🔍 Searching for Hysteria servers ...${RESET}"
@@ -1859,6 +2458,9 @@ while true; do
                   delete_cron_job_action
                   ;;
                 6)
+                  configure_port_hopping_action
+                  ;;
+                7)
                   echo -e "${YELLOW}Returning to previous menu...${RESET}"
                   break # Break out of this while loop to return to Hysteria Tunnel Management
                   ;;
@@ -1884,8 +2486,9 @@ while true; do
               echo -e "  ${YELLOW}3)${RESET} ${WHITE}Delete a Hysteria client${RESET}"
               echo -e "  ${YELLOW}4)${RESET} ${BLUE}Schedule Hysteria client restart${RESET}"
               echo -e "  ${YELLOW}5)${RESET} ${RED}Delete scheduled restart${RESET}"
-              echo -e "  ${YELLOW}6)${RESET} ${WHITE}Speedtest from server${RESET}" # New option
-              echo -e "  ${YELLOW}7)${RESET} ${WHITE}Back to previous menu${RESET}" # Adjusted number
+              echo -e "  ${YELLOW}6)${RESET} ${WHITE}Speedtest from server${RESET}"
+              echo -e "  ${YELLOW}7)${RESET} ${WHITE}Manage Client Ports${RESET}" # New option
+              echo -e "  ${YELLOW}8)${RESET} ${WHITE}Back to previous menu${RESET}" # Adjusted number
               echo ""
               draw_line "$CYAN" "-" 40
               echo -e "👉 ${CYAN}Your choice:${RESET} "
@@ -2015,14 +2618,17 @@ while true; do
                 6) # New Speedtest option
                   speedtest_from_server_action
                   ;;
-                7) # Adjusted number for Back to previous menu
+                7) # Manage Client Ports
+                  manage_client_ports_action
+                  ;;
+                8) # Adjusted number for Back to previous menu
                   echo -e "${YELLOW}Returning to previous menu...${RESET}"
                   break # Break out of this while loop to return to Hysteria Tunnel Management
                   ;;
                 *)
                   echo -e "${RED}❌ Invalid option.${RESET}"
                   echo ""
-                  echo -e "${YELLOW}Press Enter to continue...${RESET}"
+                  echo -e "${YELLOW}Press Press Enter to continue...${RESET}"
                   read -p ""
                   ;;
               esac
@@ -2041,16 +2647,13 @@ while true; do
         esac
       done
       ;;
-    3) # Hysteria ping test (NEW)
-      hysteria_ping_test_action
-      ;;
-    4) # Certificate Management option (re-numbered)
+    3) # Certificate Management option (re-numbered)
       certificate_management_menu
       ;;
-    5) # Uninstall Hysteria and cleanup (re-numbered and text updated)
+    4) # Uninstall Hysteria and cleanup (re-numbered and text updated)
       uninstall_hysteria_and_direct_action
       ;;
-    6) # Exit (re-numbered)
+    5) # Exit (re-numbered)
       exit 0
       ;;
     *)
@@ -2062,5 +2665,3 @@ while true; do
   esac
   echo ""
 done
-# Removed the else block for Rust readiness as it's no longer a prerequisite for this script.
-�
